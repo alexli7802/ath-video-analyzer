@@ -21,9 +21,18 @@ class VideoPlayer:
         self.total_frames = 0
         self.fps = 30
         self.detection_enabled = True
+        self.last_detections = []  # Cache last detections
+        self.detection_frame_skip = 3  # Only detect every N frames
+        
+        # Tracking variables
+        self.tracker = None
+        self.tracking_active = False
+        self.frames_since_detection = 0
+        self.redetect_interval = 15  # Re-detect every 15 frames for fast-moving athletes
         
         # Initialize person detection
         self.init_detection()
+        self.init_motion_detection()
         
         self.setup_ui()
     
@@ -36,25 +45,308 @@ class VideoPlayer:
             print(f"Warning: Could not initialize person detection: {e}")
             self.hog = None
     
+    def init_motion_detection(self):
+        """Initialize background subtraction for motion detection"""
+        try:
+            # Background subtractor for motion detection
+            self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+                detectShadows=True,
+                varThreshold=50,  # More sensitive to motion
+                history=20        # Shorter history for faster adaptation
+            )
+            self.prev_frame = None
+            print("Motion detection initialized")
+        except Exception as e:
+            print(f"Warning: Could not initialize motion detection: {e}")
+            self.bg_subtractor = None
+    
+    def init_tracker(self, frame, bbox):
+        """Initialize simple centroid-based tracker"""
+        try:
+            x, y, w, h = bbox
+            self.tracker = {
+                'bbox': (x, y, w, h),
+                'centroid': (x + w//2, y + h//2),
+                'prev_frame': frame.copy()
+            }
+            self.tracking_active = True
+            self.frames_since_detection = 0
+            print(f"Simple tracker initialized at frame {self.current_frame}")
+            return True
+        except Exception as e:
+            print(f"Tracker initialization error: {e}")
+            self.tracking_active = False
+            return False
+    
+    def update_tracker(self, frame):
+        """Update simple tracker using template matching"""
+        if not self.tracker:
+            return False, None
+        
+        try:
+            x, y, w, h = self.tracker['bbox']
+            prev_frame = self.tracker['prev_frame']
+            
+            # Extract template from previous frame with padding for robustness
+            pad = 5
+            template_y1 = max(0, y - pad)
+            template_x1 = max(0, x - pad) 
+            template_y2 = min(prev_frame.shape[0], y + h + pad)
+            template_x2 = min(prev_frame.shape[1], x + w + pad)
+            
+            template = prev_frame[template_y1:template_y2, template_x1:template_x2]
+            if template.size == 0:
+                return False, None
+            
+            # Larger search margin for fast-moving athletes
+            search_margin = 120
+            x1 = max(0, x - search_margin)
+            y1 = max(0, y - search_margin)
+            x2 = min(frame.shape[1], x + w + search_margin)
+            y2 = min(frame.shape[0], y + h + search_margin)
+            
+            search_region = frame[y1:y2, x1:x2]
+            if search_region.size == 0:
+                return False, None
+            
+            # Try multiple template matching approaches for robustness
+            best_val = 0
+            best_loc = None
+            
+            # Standard template matching
+            result = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            if max_val > best_val:
+                best_val = max_val
+                best_loc = max_loc
+            
+            # Try with slightly scaled template for size variations
+            for scale in [0.9, 1.1]:
+                try:
+                    scaled_h, scaled_w = int(template.shape[0] * scale), int(template.shape[1] * scale)
+                    if scaled_h > 10 and scaled_w > 10:
+                        scaled_template = cv2.resize(template, (scaled_w, scaled_h))
+                        result = cv2.matchTemplate(search_region, scaled_template, cv2.TM_CCOEFF_NORMED)
+                        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                        if max_val > best_val:
+                            best_val = max_val
+                            best_loc = max_loc
+                except:
+                    continue
+            
+            # Lower threshold for fast-moving athletes (they change appearance quickly)
+            if best_val > 0.25 and best_loc is not None:  # More lenient threshold for athletes
+                new_x = x1 + best_loc[0]
+                new_y = y1 + best_loc[1]
+                new_bbox = (new_x, new_y, w, h)
+                
+                self.tracker['bbox'] = new_bbox
+                self.tracker['centroid'] = (new_x + w//2, new_y + h//2)
+                self.tracker['prev_frame'] = frame.copy()
+                
+                return True, new_bbox
+            else:
+                return False, None
+                
+        except Exception as e:
+            print(f"Tracker update error: {e}")
+            return False, None
+    
     def detect_persons(self, frame):
         """Detect persons in frame and return bounding boxes"""
         if not self.hog:
             return []
         
         try:
-            # Detect people in the frame
-            boxes, weights = self.hog.detectMultiScale(frame, winStride=(8,8), padding=(8,8), scale=1.05)
+            # Convert to grayscale for better HOG performance
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Skip expensive histogram equalization for performance
+            # gray = cv2.equalizeHist(gray)
+            
+            # Use single, optimized detection pass
+            boxes, weights = self.hog.detectMultiScale(
+                gray, 
+                winStride=(8,8),    # Balance between accuracy and speed
+                padding=(16,16),    
+                scale=1.05,         # Reasonable scale step
+                hitThreshold=0.0    # Lower hit threshold for better detection
+            )
             
             # Filter detections by confidence
             persons = []
             for (x, y, w, h), weight in zip(boxes, weights):
-                if weight > 0.5:  # Confidence threshold
+                if weight > 0.3:  # Balanced confidence threshold
                     persons.append((x, y, x+w, y+h))
             
             return persons
         except Exception as e:
             print(f"Detection error: {e}")
             return []
+    
+    def detect_motion(self, frame):
+        """Detect moving objects using background subtraction"""
+        if not self.bg_subtractor:
+            return []
+        
+        try:
+            # Apply background subtraction
+            fg_mask = self.bg_subtractor.apply(frame)
+            
+            # Remove shadows
+            fg_mask[fg_mask == 127] = 0  # Remove shadow pixels
+            
+            # Morphological operations to clean up the mask
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+            
+            # Find contours
+            contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            detections = []
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                # Filter by area - human-sized objects
+                if 500 < area < 20000:  # Adjust based on video resolution
+                    x, y, w, h = cv2.boundingRect(contour)
+                    # Filter by aspect ratio - roughly human proportions
+                    aspect_ratio = h / w if w > 0 else 0
+                    if 1.2 < aspect_ratio < 4.0:  # Tall objects like people
+                        detections.append((x, y, x+w, y+h))
+            
+            return detections
+        except Exception as e:
+            print(f"Motion detection error: {e}")
+            return []
+    
+    def detect_optical_flow(self, frame):
+        """Detect moving objects using optical flow"""
+        if self.prev_frame is None:
+            self.prev_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            return []
+        
+        try:
+            current_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Calculate optical flow
+            flow = cv2.calcOpticalFlowPyrLK(
+                self.prev_frame, current_gray, None, None,
+                winSize=(15, 15), maxLevel=2,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
+            )
+            
+            # Create motion magnitude image
+            flow_magnitude = cv2.calcOpticalFlowPyrLK(
+                self.prev_frame, current_gray, None, None
+            )
+            
+            # Alternative: Use dense optical flow for motion detection
+            flow = cv2.calcOpticalFlowFarneback(
+                self.prev_frame, current_gray, None, 
+                0.5, 3, 15, 3, 5, 1.2, 0
+            )
+            
+            # Calculate magnitude of flow vectors
+            magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+            
+            # Threshold to find areas with significant motion
+            motion_thresh = np.mean(magnitude) + 2 * np.std(magnitude)
+            motion_mask = (magnitude > motion_thresh).astype(np.uint8) * 255
+            
+            # Find contours in motion areas
+            contours, _ = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            detections = []
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if 300 < area < 15000:  # Human-sized motion areas
+                    x, y, w, h = cv2.boundingRect(contour)
+                    detections.append((x, y, x+w, y+h))
+            
+            self.prev_frame = current_gray
+            return detections
+            
+        except Exception as e:
+            print(f"Optical flow detection error: {e}")
+            self.prev_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            return []
+    
+    def non_max_suppression(self, boxes, overlap_threshold):
+        """Apply non-maximum suppression to remove duplicate detections"""
+        if len(boxes) == 0:
+            return []
+        
+        # Convert to format needed for NMS
+        boxes_array = np.array(boxes, dtype=np.float32)
+        
+        # Calculate areas
+        areas = (boxes_array[:, 2] - boxes_array[:, 0]) * (boxes_array[:, 3] - boxes_array[:, 1])
+        
+        # Sort by bottom-right y-coordinate
+        indices = np.argsort(boxes_array[:, 3])
+        
+        keep = []
+        while len(indices) > 0:
+            # Pick the last index
+            last = len(indices) - 1
+            i = indices[last]
+            keep.append(i)
+            
+            # Find the largest coordinates for the intersection rectangle
+            xx1 = np.maximum(boxes_array[i, 0], boxes_array[indices[:last], 0])
+            yy1 = np.maximum(boxes_array[i, 1], boxes_array[indices[:last], 1])
+            xx2 = np.minimum(boxes_array[i, 2], boxes_array[indices[:last], 2])
+            yy2 = np.minimum(boxes_array[i, 3], boxes_array[indices[:last], 3])
+            
+            # Compute the width and height of the intersection rectangle
+            w = np.maximum(0, xx2 - xx1)
+            h = np.maximum(0, yy2 - yy1)
+            
+            # Compute the intersection over union
+            intersection = w * h
+            union = areas[i] + areas[indices[:last]] - intersection
+            overlap = intersection / union
+            
+            # Delete indices with overlap greater than threshold
+            indices = np.delete(indices, np.concatenate(([last], np.where(overlap > overlap_threshold)[0])))
+        
+        return [boxes[i] for i in keep]
+    
+    def detect_athletes_multi_method(self, frame):
+        """Combined detection using multiple methods for better athlete detection"""
+        all_detections = []
+        
+        # Method 1: HOG person detection (works for upright poses)
+        if self.hog:
+            hog_detections = self.detect_persons(frame)
+            all_detections.extend(hog_detections)
+        
+        # Method 2: Motion detection (good for moving athletes)
+        motion_detections = self.detect_motion(frame)
+        all_detections.extend(motion_detections)
+        
+        # Method 3: Optical flow detection (sensitive to movement)
+        # Skip optical flow every few frames for performance
+        if self.current_frame % 3 == 0:
+            flow_detections = self.detect_optical_flow(frame)
+            all_detections.extend(flow_detections)
+        
+        # Remove duplicates and overlapping detections
+        if len(all_detections) > 1:
+            all_detections = self.non_max_suppression(all_detections, 0.5)
+        
+        # Filter by confidence - prefer detections that multiple methods agree on
+        final_detections = []
+        if len(all_detections) > 0:
+            # If we have multiple detections, prefer the largest (likely most complete)
+            if len(all_detections) > 1:
+                largest = max(all_detections, key=lambda d: (d[2]-d[0])*(d[3]-d[1]))
+                final_detections = [largest]
+            else:
+                final_detections = all_detections
+        
+        return final_detections
     
     def draw_bounding_boxes(self, frame, detections):
         """Draw bounding boxes around detected persons"""
@@ -73,6 +365,10 @@ class VideoPlayer:
     def toggle_detection(self):
         """Toggle athlete detection on/off"""
         self.detection_enabled = self.detection_var.get()
+        if not self.detection_enabled:
+            # Reset tracking when detection is disabled
+            self.tracking_active = False
+            self.tracker = None
         
     def setup_ui(self):
         # Main frame
@@ -167,6 +463,11 @@ class VideoPlayer:
             self.fps = self.cap.get(cv2.CAP_PROP_FPS)
             self.current_frame = 0
             
+            # Reset tracking when loading new video
+            self.tracking_active = False
+            self.tracker = None
+            self.frames_since_detection = 0
+            
             self.progress_bar.config(to=self.total_frames-1, state="normal")
             
             # Display first frame and start playback automatically
@@ -222,9 +523,52 @@ class VideoPlayer:
                 
             resized_frame = cv2.resize(frame, (new_width, new_height))
             
-            # Detect athletes and draw bounding boxes
-            detections = self.detect_persons(resized_frame)
-            resized_frame = self.draw_bounding_boxes(resized_frame, detections)
+            # Detect/track athletes and draw bounding boxes
+            detections = []
+            if self.detection_enabled:
+                self.frames_since_detection += 1
+                
+                # Use tracking if active and successful
+                if self.tracking_active and self.tracker:
+                    success, bbox = self.update_tracker(resized_frame)
+                    if success:
+                        x, y, w, h = [int(v) for v in bbox]
+                        detections = [(x, y, x+w, y+h)]
+                        print(f"person tracked, frame [{self.current_frame}]")
+                        
+                        # Re-detect periodically to refresh tracker
+                        if self.frames_since_detection >= self.redetect_interval:
+                            new_detections = self.detect_athletes_multi_method(resized_frame)
+                            if new_detections:
+                                # Reinitialize tracker with new detection
+                                largest_detection = max(new_detections, key=lambda d: (d[2]-d[0])*(d[3]-d[1]))
+                                x1, y1, x2, y2 = largest_detection
+                                self.init_tracker(resized_frame, (x1, y1, x2-x1, y2-y1))
+                                detections = [largest_detection]
+                                print(f"tracker refreshed, frame [{self.current_frame}]")
+                            else:
+                                self.frames_since_detection = 0  # Reset counter
+                    else:
+                        # Tracking failed, fall back to detection
+                        self.tracking_active = False
+                        detections = self.detect_athletes_multi_method(resized_frame)
+                        if detections:
+                            # Initialize tracker with first detection
+                            largest_detection = max(detections, key=lambda d: (d[2]-d[0])*(d[3]-d[1]))
+                            x1, y1, x2, y2 = largest_detection
+                            self.init_tracker(resized_frame, (x1, y1, x2-x1, y2-y1))
+                            print(f"tracking failed, re-detected, frame [{self.current_frame}]")
+                else:
+                    # No active tracking, use detection
+                    detections = self.detect_athletes_multi_method(resized_frame)
+                    if detections:
+                        # Initialize tracker with first detection
+                        largest_detection = max(detections, key=lambda d: (d[2]-d[0])*(d[3]-d[1]))
+                        x1, y1, x2, y2 = largest_detection
+                        self.init_tracker(resized_frame, (x1, y1, x2-x1, y2-y1))
+                        print(f"athlete detected and tracking started, frame [{self.current_frame}]")
+                
+                resized_frame = self.draw_bounding_boxes(resized_frame, detections)
             
             frame_rgb = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
             
@@ -274,8 +618,10 @@ class VideoPlayer:
         frame = cv2.resize(frame, (new_width, new_height))
         
         # Detect athletes and draw bounding boxes
-        detections = self.detect_persons(frame)
-        frame = self.draw_bounding_boxes(frame, detections)
+        detections = []
+        if self.detection_enabled:
+            detections = self.detect_athletes_multi_method(frame)
+            frame = self.draw_bounding_boxes(frame, detections)
         
         # Convert BGR to RGB
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
