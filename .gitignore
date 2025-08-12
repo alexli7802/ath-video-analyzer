@@ -46,3 +46,12 @@ Thumbs.db
 
 # Image folder
 img/
+images/
+
+# Model files (too large for git)
+*.weights
+*.pb
+*.pbtxt
+*.cfg
+models/
+*.tar.gz

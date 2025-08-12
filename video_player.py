@@ -7,6 +7,9 @@ from PIL import Image, ImageTk
 import os
 import numpy as np
 
+# Import DNNDetector from detectMultiScale_demo
+from detectMultiScale_demo import DNNDetector
+
 class VideoPlayer:
     def __init__(self, root):
         self.root = root
@@ -28,28 +31,27 @@ class VideoPlayer:
         self.setup_ui()
     
     def init_detection(self):
-        """Initialize person detection using OpenCV's built-in HOG descriptor"""
+        """Initialize person detection using DNN detector"""
         try:
-            self.hog = cv2.HOGDescriptor()
-            self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+            self.detector = DNNDetector()
+            print(f"Initialized: {self.detector.get_name()}")
         except Exception as e:
             print(f"Warning: Could not initialize person detection: {e}")
-            self.hog = None
+            self.detector = None
     
     def detect_persons(self, frame):
         """Detect persons in frame and return bounding boxes"""
-        if not self.hog:
+        if not self.detector:
             return []
         
         try:
-            # Detect people in the frame
-            boxes, weights = self.hog.detectMultiScale(frame, winStride=(8,8), padding=(8,8), scale=1.05)
+            # Detect people in the frame using DNN detector
+            boxes = self.detector.detect(frame)
             
-            # Filter detections by confidence
+            # Convert (x, y, w, h) format to (x1, y1, x2, y2) format
             persons = []
-            for (x, y, w, h), weight in zip(boxes, weights):
-                if weight > 0.5:  # Confidence threshold
-                    persons.append((x, y, x+w, y+h))
+            for (x, y, w, h) in boxes:
+                persons.append((x, y, x+w, y+h))
             
             return persons
         except Exception as e:
@@ -57,16 +59,14 @@ class VideoPlayer:
             return []
     
     def draw_bounding_boxes(self, frame, detections):
-        """Draw bounding boxes around detected persons"""
-        for i, (x1, y1, x2, y2) in enumerate(detections):
-            # Draw rectangle
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        """Draw circles at the center of detected persons"""
+        for (x1, y1, x2, y2) in detections:
+            # Calculate center of bounding box
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
             
-            # Add label
-            label = f"Athlete {i+1}"
-            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-            cv2.rectangle(frame, (x1, y1-label_size[1]-10), (x1+label_size[0], y1), (0, 255, 0), -1)
-            cv2.putText(frame, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+            # Draw solid red circle (radius = 10 pixels)
+            cv2.circle(frame, (center_x, center_y), 10, (0, 0, 255), -1)
         
         return frame
     
@@ -132,6 +132,11 @@ class VideoPlayer:
                                                  variable=self.detection_var,
                                                  command=self.toggle_detection)
         self.detection_checkbox.pack(side=tk.LEFT)
+        
+        # Export button
+        self.export_btn = ttk.Button(detection_frame, text="Export Video", 
+                                    command=self.export_video)
+        self.export_btn.pack(side=tk.RIGHT)
         
         # Initially disable progress bar
         self.progress_bar.config(state="disabled")
@@ -327,6 +332,92 @@ class VideoPlayer:
         self.display_frame()
         self.update_time_label()
         
+    def export_video(self):
+        """Export video with tracking circles"""
+        if not self.cap or not self.video_file:
+            messagebox.showerror("Error", "No video loaded")
+            return
+        
+        # Get output filename
+        output_file = filedialog.asksaveasfilename(
+            title="Save Video As",
+            defaultextension=".mp4",
+            filetypes=[("MP4 files", "*.mp4"), ("AVI files", "*.avi"), ("All files", "*.*")]
+        )
+        
+        if not output_file:
+            return
+        
+        try:
+            # Create new VideoCapture for export (don't interfere with playback)
+            export_cap = cv2.VideoCapture(self.video_file)
+            
+            # Get video properties
+            fps = export_cap.get(cv2.CAP_PROP_FPS)
+            width = int(export_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(export_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames = int(export_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            # Create VideoWriter
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output_file, fourcc, fps, (width, height))
+            
+            if not out.isOpened():
+                messagebox.showerror("Error", "Could not create output video file")
+                export_cap.release()
+                return
+            
+            # Show progress dialog
+            progress_window = tk.Toplevel(self.root)
+            progress_window.title("Exporting Video")
+            progress_window.geometry("400x100")
+            progress_window.resizable(False, False)
+            
+            progress_label = ttk.Label(progress_window, text="Exporting video with tracking circles...")
+            progress_label.pack(pady=10)
+            
+            export_progress = ttk.Progressbar(progress_window, length=300, mode='determinate')
+            export_progress.pack(pady=10)
+            export_progress['maximum'] = total_frames
+            
+            self.root.update()
+            
+            frame_count = 0
+            while True:
+                ret, frame = export_cap.read()
+                if not ret:
+                    break
+                
+                # Detect persons and draw circles if detection is enabled
+                if self.detection_enabled:
+                    detections = self.detect_persons(frame)
+                    frame = self.draw_bounding_boxes(frame, detections)
+                
+                # Write frame
+                out.write(frame)
+                frame_count += 1
+                
+                # Update progress every 10 frames
+                if frame_count % 10 == 0:
+                    export_progress['value'] = frame_count
+                    progress_window.update()
+            
+            # Cleanup
+            export_cap.release()
+            out.release()
+            progress_window.destroy()
+            
+            messagebox.showinfo("Success", f"Video exported successfully to:\n{output_file}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Export failed: {str(e)}")
+            if 'export_cap' in locals():
+                export_cap.release()
+            if 'out' in locals():
+                out.release()
+            if 'progress_window' in locals():
+                progress_window.destroy()
+
     def on_closing(self):
         self.playing = False
         if self.cap:
